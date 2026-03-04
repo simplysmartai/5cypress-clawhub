@@ -1,10 +1,11 @@
 """
-Skill 3: Federal Contract / SAM.gov Opportunity Digest
-Queries the SAM.gov Opportunities API (free public API key required from SAM.gov).
+Skill 3: Federal Contract Digest
+Queries the USA Spending API (public, no API key required).
+Real federal contract data — no mock/example fallbacks.
 Filters by NAICS code, state, and keyword so small businesses get only relevant contracts.
 
-SAM.gov API key: free at https://sam.gov/profile/details (API Keys tab)
-Set in env: SAM_GOV_API_KEY=your_key_here
+USA Spending API: https://api.usaspending.gov/api/v2 (free, public, real data)
+No API key needed. Data refreshes weekly.
 
 Endpoints:
   GET /contracts/digest?category=electrical&state=FL&limit=10
@@ -12,7 +13,6 @@ Endpoints:
   GET /contracts/categories  (valid NAICS category names)
 """
 
-import os
 import logging
 from typing import Literal
 
@@ -26,11 +26,10 @@ from models import SuccessResponse
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# 6-hour cache — contract listings update daily
+# 6-hour cache — contract listings update weekly on USA Spending
 _cache: TTLCache = TTLCache(maxsize=200, ttl=21600)
 
-SAM_API_BASE = "https://api.sam.gov/opportunities/v2/search"
-SAM_API_KEY = os.getenv("SAM_GOV_API_KEY", "")
+USA_SPENDING_API_BASE = "https://api.usaspending.gov/api/v2/search/spending_by_award"
 
 # Trade category → NAICS code mapping
 CATEGORY_NAICS: dict[str, str] = {
@@ -58,82 +57,68 @@ CATEGORY_NAICS: dict[str, str] = {
 CATEGORIES = list(CATEGORY_NAICS.keys())
 
 
-async def _query_sam(
+async def _query_usa_spending(
     naics: str,
     state: str | None,
     keyword: str | None,
     limit: int,
 ) -> list[dict]:
-    if not SAM_API_KEY:
-        # Return mock data if no key configured so skill is still testable
-        return _mock_contracts(naics, state)
-
-    params: dict = {
-        "api_key": SAM_API_KEY,
-        "ptype": "o",          # opportunities
-        "ncode": naics,
-        "limit": str(min(limit, 25)),
-        "offset": "0",
-        "active": "Yes",
-        "sorty": "datePosted",
-        "sort": "-",
+    """Query USA Spending API for real federal contract data (no API key needed)."""
+    
+    # Build filter criteria
+    filters = {
+        "naics": [{"contains": naics}],
+        "keywords": [keyword] if keyword else [],
+        "award_type_codes": ["A", "B", "C", "D"],  # All federal contract types
     }
+    
     if state:
-        params["state"] = state.upper()
-    if keyword:
-        params["q"] = keyword
+        filters["place_of_performance_locations"] = [{"state": state.upper()}]
+
+    params = {
+        "filters": filters,
+        "limit": min(limit, 100),
+    }
 
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
-            r = await client.get(SAM_API_BASE, params=params)
+            r = await client.get(
+                USA_SPENDING_API_BASE,
+                params={"limit": min(limit, 100)},
+                json=params,
+            )
             r.raise_for_status()
             data = r.json()
-            return data.get("opportunitiesData", [])
+            return data.get("results", [])
     except httpx.HTTPStatusError as e:
-        logger.error(f"SAM.gov HTTP error: {e.response.status_code} — {e.response.text[:200]}")
-        return []
+        logger.error(f"USA Spending HTTP error: {e.response.status_code}")
+        raise HTTPException(status_code=502, detail="Federal contract data unavailable")
     except Exception as e:
-        logger.error(f"SAM.gov query error: {e}")
-        return []
-
-
-def _mock_contracts(naics: str, state: str | None) -> list[dict]:
-    """Returns example data when SAM_GOV_API_KEY is not configured."""
-    return [
-        {
-            "noticeId": "MOCK-001",
-            "title": f"[EXAMPLE] Facility Upgrade — NAICS {naics}",
-            "postedDate": "2026-02-20",
-            "responseDeadLine": "2026-03-20",
-            "naicsCode": naics,
-            "type": "Combined Synopsis/Solicitation",
-            "fullParentPathName": "DEPT OF DEFENSE",
-            "placeOfPerformance": {"state": {"code": state or "VA"}},
-            "pointOfContact": [{"email": "contracting@agency.gov", "name": "Jane Smith"}],
-            "_note": "This is example data. Add SAM_GOV_API_KEY env var for live data.",
-        }
-    ]
+        logger.error(f"USA Spending query error: {e}")
+        raise HTTPException(status_code=502, detail="Failed to fetch contracts")
 
 
 def _format_contract(raw: dict) -> dict:
-    pop = raw.get("placeOfPerformance", {})
-    state_info = pop.get("state", {})
-    contacts = raw.get("pointOfContact", [{}])
-    contact = contacts[0] if contacts else {}
+    """Format USA Spending API response into consistent contract object."""
+    award = raw.get("award", {})
+    recipient = award.get("recipient", {})
+    txn = raw.get("latest_transaction", {})
+    place = award.get("place_of_performance", {})
+    
     return {
-        "id": raw.get("noticeId"),
-        "title": raw.get("title"),
-        "type": raw.get("type"),
-        "agency": raw.get("fullParentPathName", "").split(".")[0].strip(),
-        "posted": raw.get("postedDate"),
-        "deadline": raw.get("responseDeadLine"),
-        "naics": raw.get("naicsCode"),
-        "state": state_info.get("code"),
-        "city": pop.get("city", {}).get("name"),
-        "contact_name": contact.get("name"),
-        "contact_email": contact.get("email"),
-        "set_aside": raw.get("typeOfSetAsideDescription"),
-        "url": f"https://sam.gov/opp/{raw.get('noticeId')}/view" if raw.get("noticeId") else None,
+        "id": award.get("id"),
+        "title": award.get("description", award.get("title", "Unnamed Award")),
+        "type": award.get("type"),
+        "agency": award.get("federal_agency", {}).get("name", "Unknown Agency"),
+        "posted": txn.get("action_date"),
+        "deadline": award.get("period_of_performance_current_end_date"),
+        "naics": award.get("naics_code", {}).get("code"),
+        "state": place.get("state_code"),
+        "city": place.get("city_name"),
+        "contact_name": None,  # USA Spending doesn't always have contact info
+        "contact_email": None,
+        "amount": award.get("total_obligation", 0),
+        "url": f"https://www.usaspending.gov/award/{award.get('id')}" if award.get("id") else None,
     }
 
 
@@ -166,7 +151,7 @@ async def get_digest(
         return SuccessResponse(data=_cache[cache_key], source="cache", cached=True)
 
     naics = CATEGORY_NAICS[category]
-    raw = await _query_sam(naics, state, None, limit)
+    raw = await _query_usa_spending(naics, state, None, limit)
     formatted = [_format_contract(r) for r in raw]
     formatted.sort(key=lambda x: x.get("deadline") or "9999", reverse=False)
 
@@ -178,7 +163,7 @@ async def get_digest(
         "opportunities": formatted,
     }
     _cache[cache_key] = result
-    return SuccessResponse(data=result, source="SAM.gov Opportunities API")
+    return SuccessResponse(data=result, source="USA Spending API")
 
 
 @router.get("/search", response_model=SuccessResponse)
@@ -196,32 +181,7 @@ async def search_contracts(
     if cache_key in _cache:
         return SuccessResponse(data=_cache[cache_key], source="cache", cached=True)
 
-    if not SAM_API_KEY:
-        return SuccessResponse(
-            data={"note": "Add SAM_GOV_API_KEY env var for live search results.", "query": q},
-            source="mock",
-        )
-
-    params: dict = {
-        "api_key": SAM_API_KEY,
-        "q": q,
-        "ptype": "o",
-        "limit": str(limit),
-        "active": "Yes",
-    }
-    if state:
-        params["state"] = state.upper()
-
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            r = await client.get(SAM_API_BASE, params=params)
-            r.raise_for_status()
-            data = r.json()
-            raw = data.get("opportunitiesData", [])
-    except Exception as e:
-        logger.error(f"SAM.gov search error: {e}")
-        raw = []
-
+    raw = await _query_usa_spending("", state, q, limit)
     formatted = [_format_contract(r) for r in raw]
     _cache[cache_key] = formatted
-    return SuccessResponse(data={"count": len(formatted), "results": formatted}, source="SAM.gov")
+    return SuccessResponse(data={"count": len(formatted), "results": formatted}, source="USA Spending API")
